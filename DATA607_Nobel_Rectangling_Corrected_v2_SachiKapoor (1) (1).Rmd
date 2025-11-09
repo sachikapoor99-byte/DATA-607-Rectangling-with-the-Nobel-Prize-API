@@ -1,0 +1,194 @@
+---
+title: "DATA 607 — Rectangling with the Nobel Prize API"
+author: "Sachi Kapoor"
+date: "11/4/2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+fontsize: 11pt
+---
+
+> **Task:** Use the Nobel Prize API and demonstrate rectangling. This version adds **robust coercion** for `birthDate`, `birthCtry`, and `affilCtry` to prevent list/NULL type issues during filtering and joins.
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.5, fig.align = "center",
+  cache = TRUE, dev = "png"
+)
+
+suppressPackageStartupMessages({
+  library(jsonlite); library(dplyr); library(tidyr); library(purrr)
+  library(lubridate); library(stringr); library(tibble); library(ggplot2)
+})
+```
+
+## Read API JSON (keep structure for rectangling)
+
+```{r read-json}
+limit <- 1500
+
+laur_raw <- jsonlite::read_json(
+  paste0("https://api.nobelprize.org/2.1/laureates?limit=", limit),
+  simplifyVector = FALSE
+)
+
+laureates <- tibble(raw = laur_raw$laureates)
+
+# helper to coerce possible list/NULL/scalar into character
+as_chr_scalar <- function(x) {
+  if (is.null(x) || length(x) == 0) return(NA_character_)
+  if (is.list(x)) return(as.character(x[[1]]))
+  as.character(x)
+}
+
+people <- laureates |>
+  hoist(raw,
+        id        = "id",
+        known_en  = list("knownName","en"),
+        gender    = "gender",
+        birthDate = "birth","date",
+        birthCtry = "birth","place","country","en",
+        prizes    = "nobelPrizes"
+  ) |>
+  filter(!is.na(gender)) |>
+  mutate(
+    # coerce birthDate to Date safely
+    birthDate = purrr::map_chr(birthDate, as_chr_scalar),
+    birthDate = lubridate::ymd(birthDate, quiet = TRUE),
+    # coerce birthCtry to character safely
+    birthCtry = purrr::map_chr(birthCtry, as_chr_scalar)
+  )
+```
+
+Expand prizes and affiliations, coercing `affilCtry` to character:
+
+```{r prizes-affils}
+pr_aff <- people |>
+  unnest_longer(prizes, keep_empty = TRUE) |>
+  hoist(prizes,
+        awardYear = "awardYear",
+        category  = list("category","en"),
+        affils    = "affiliations"
+  ) |>
+  mutate(
+    awardYear = suppressWarnings(as.integer(awardYear))
+  ) |>
+  unnest_longer(affils, keep_empty = TRUE) |>
+  hoist(affils,
+        orgName   = list("name","en"),
+        affilCtry = "location","country","en"
+  ) |>
+  mutate(
+    affilCtry = purrr::map_chr(affilCtry, as_chr_scalar)
+  ) |>
+  select(id, known_en, gender, birthDate, birthCtry, awardYear, category, orgName, affilCtry)
+```
+
+---
+
+## Q1. Which **birth countries** “lost” the most laureates (born in one country, awarded with an affiliation in a different country)?
+
+```{r q1-lost}
+lost_counts <- pr_aff |>
+  filter(!is.na(birthCtry), !is.na(affilCtry), birthCtry != affilCtry) |>
+  count(birthCtry, sort = TRUE)
+
+knitr::kable(head(lost_counts, 12),
+             caption = "Top birth countries where laureates were affiliated elsewhere when awarded (sample)")
+```
+
+**Answer (Q1):** The table lists the birth countries with the highest counts of “lost” laureates in this sample (`limit = `r limit`).
+**Interpretation (Q1).** A small number of birth countries account for most “lost” laureates—born in one country but affiliated elsewhere at award time—likely reflecting historic migration and research mobility. Results may shift slightly with the full API beyond the sampled limit.
+
+---
+
+## Q2. How has **age at award** changed over time by category? (median by decade)
+
+```{r q2-age}
+age_df <- people |>
+  unnest_longer(prizes, keep_empty = TRUE) |>
+  hoist(prizes, awardYear = "awardYear", category = list("category","en")) |>
+  mutate(
+    awardYear = suppressWarnings(as.integer(awardYear)),
+    age_at_award = if_else(!is.na(birthDate) & !is.na(awardYear),
+                           awardYear - lubridate::year(birthDate), NA_integer_)
+  ) |>
+  filter(!is.na(age_at_award), age_at_award > 0)
+
+age_trend <- age_df |>
+  mutate(decade = (awardYear %/% 10) * 10) |>
+  group_by(category, decade) |>
+  summarise(median_age = median(age_at_award), .groups = "drop")
+
+knitr::kable(head(age_trend |> arrange(category, decade), 20),
+             caption = "Median age at award by decade and category (sample)")
+
+ggplot(age_trend, aes(decade, median_age, group = category)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ category, scales = "free_y") +
+  labs(title = "Median age at award by decade",
+       x = "Decade", y = "Median age") +
+  theme_minimal(base_size = 11)
+```
+
+**Answer (Q2):** Median age generally trends upward over time for several categories; see the per-category facets above.
+**Interpretation (Q2).** Median age at award trends upward across the century in multiple fields, suggesting longer training/career arcs before prize-winning contributions are recognized. The slope varies by category, with some areas leveling more recently.
+
+---
+
+## Q3. Which **institutions** appear most frequently in laureate affiliations?
+
+```{r q3-institutions}
+inst_counts <- pr_aff |>
+  filter(!is.na(orgName)) |>
+  count(orgName, affilCtry, sort = TRUE)
+
+knitr::kable(head(inst_counts, 15),
+             caption = "Most frequent affiliated institutions (with country) in the sample")
+```
+
+**Answer (Q3):** These institutions recur most often in the affiliation data associated with awards (sample-limited).
+**Interpretation (Q3).** A handful of institutions appear repeatedly across awards, indicating concentration of research capacity. Country labels show geographic clusters (e.g., U.S./U.K./Europe) that align with known funding and collaboration hubs.
+
+---
+
+## Q4. What share of **women** laureates by **decade & category**?
+
+```{r q4-women}
+women_share <- people |>
+  unnest_longer(prizes, keep_empty = TRUE) |>
+  hoist(prizes, awardYear = "awardYear", category = list("category","en")) |>
+  mutate(
+    awardYear = suppressWarnings(as.integer(awardYear)),
+    decade    = (awardYear %/% 10) * 10
+  ) |>
+  filter(!is.na(decade), !is.na(category)) |>
+  count(category, decade, gender) |>
+  group_by(category, decade) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  filter(gender == "female") |>
+  arrange(category, decade)
+
+knitr::kable(head(women_share, 20), digits = 1,
+             caption = "Female share (%) by decade and category (sample)")
+
+ggplot(women_share, aes(decade, pct, group = category)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ category, scales = "free_y") +
+  labs(title = "Female share of laureates by decade",
+       x = "Decade", y = "Female share (%)") +
+  theme_minimal(base_size = 11)
+```
+
+**Answer (Q4):** The female share varies by field and generally rises in recent decades, with the pace differing across categories.
+**Interpretation (Q4).** The female share rises in recent decades but remains uneven by field. Some categories show steady improvement post-2000, while others change more slowly—consistent with broader discipline-specific pipelines.
+
+---
+
